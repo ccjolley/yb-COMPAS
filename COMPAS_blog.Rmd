@@ -1,0 +1,271 @@
+---
+title: "COMPAS blog draft"
+author: "Craig Jolley"
+date: "April 9, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction 
+
+With all of the recnt news about data breaches and tech giants pledging to #DeleteFacebook, something unexpected is happening. It seems like people are actually starting to care about online privacy. At the same time, awareness has been building around the real and potential harms of algorithmic decision-making systems. Scholarly organizations like [FAT*](https://fatconference.org/) and [AI Now](https://ainowinstitute.org/) have been getting more attention, and concern about algorithmic harms has been filtering into pop culture. At least among people who like [nerdy webcomics](https://xkcd.com/1390/). I knew we were entering a new era when I couldn't even escape the ["AI run amok"](http://www.imdb.com/title/tt1751956/plotsummary?ref_=tt_ov_pl) meme while watching cartoons with my 5-year-old.
+
+I've recently been experimenting with the Yellowbrick library in Python, which is designed to make the machine learning process more visual. It offers a series of objects called Visualisers, which use a syntaxF that should be familiar to scikit-learn users. In this post, I want to explore whether we can use the tools in Yellowbrick to "audit" a black-box algorithm and assess claims about fairness and bias. At the same time, though, I prefer R for most visualization tasks. Fortunately, the new reticulate package has allowed Python part-timers like me to get something close to the best of both worlds.
+
+Algorithmic fairness can be a complicated topic, but there are two definitions we should keep in mind. (For more details, check out [this paper](https://arxiv.org/abs/1609.07236).) If we're interested in _group fairness_, then we define groups of people whom we expect, on average, to be equal with respect to whatever we're quantifying. Those groups could be based on race, gender, or anything else that you believe is (or should be) irrelevant to your model's predictions. Group fairness is easy to measure, but can be [legally tricky](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2477899), at least in the U.S. In situations with pre-existing structural inequities, group fairness can be similar to the concept of "fairness through awareness" -- the only way to treat groups equally is to take people's membership in those groups into account and correct for an existing unlevel playing field. 
+
+At the other end of the spectrum, there's _individual fairness_. If we're being individually fair, then similar individuals get treated similarly. We can define "similarity" in a way that ignores protected categories (like race, gender, etc.) and evaluates people only based on their education, driving record, Netflix viewing history, or other not-explicitly-sensitive variables. We could refer to this approach as "fairness through blindness" -- you're just choosing not to include problematic variables in your model. There are a couple of problems with this approach. One is a problem for model developers -- a lot of your "non-sensitive" variables are going to correlate with your sensitive ones. People who are different in big ways will be different in lots of little ways as well, and it might be hard to predict in advance what all those differences are going to be. This gets especially difficult if you're committed to fairness through blindness and never collected those sensitive data in the first place, so the correlations are impossible to discover. The other problem is for model _customers_ -- the people who will be using the model but weren't around when it was being built. Unless the software developers offer a lot of information about the model-building process in a way that customers can understand, they won't be able to tell whether a model is individually-fair or not. The only way to really test individual fairness is to query the model with counterfactual examples -- determining whether it would give different outputs if you modified the race (or other correlated characteristics) of people who had already been assessed.
+
+This blog post will focus on the [COMPAS dataset](https://github.com/propublica/compas-analysis) released a couple of years ago by ProPublica. The [COMPAS algorithm](http://www.equivant.com/solutions/inmate-classification) offers predictions of a criminal suspect's risk of recidivism and returns a score on a scale from 1 (low risk) to 10 (high risk). The ProPublica dataset contains predictions for ## people in Broward County, FL, along with some demographic features (race, age, gender), data about their prior criminal record, and whether they actually _did_ reoffend following their algorithmic assessment.
+
+What I'm doing here is a little different from what ProPublica [did](https://github.com/propublica/compas-analysis/blob/master/Compas%20Analysis.ipynb) in their analysis of the dataset. Their approach was to use logistic regression to determine the influence of race on the COMPAS score (which they simplified into a binary low/high) after controlling for prior record, seriousness of the crime, and actual recidivism. Instead, I'll be approaching it the way that model developers might, by looking at the distribution of model errors across racial categories. (Spoiler alert: the results are pretty much the same, and the news isn't good.)
+
+We'll start by loading some R packages and our dataset.
+
+```{r load, message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(reshape2)
+library(reticulate)
+use_python('/usr/bin/python3')
+
+d <- read.csv('data/compas-scores-two-years.csv')
+```
+
+## Evaluating group fairness
+
+First, we should get a sense of what the customers of a tool like COMPAS would be able to see, even if they were not given access to any of the algorithm's training data or details about its performance. Given a set of evaluations, are there racial imbalances in the scores given by COMPAS? [Explain a bit about prediction score and jitter.]
+
+```{r race_decile}
+X1 <- d %>% select(race,decile_score)
+X1$race <- factor(X1$race,levels(X1$race)[c(1,3,4,2,5,6)])
+delta <- 0.35
+X1_m <- X1 %>% group_by(race) %>% 
+  summarize(m=mean(decile_score)) 
+X1_m$xmin <- (1:6)-delta
+X1_m$xmax <- (1:6)+delta
+ggplot(X1,aes(x=race,y=decile_score)) +
+  geom_jitter(size=2,shape=1,color='cornflowerblue',alpha=0.25) +
+  geom_segment(data=X1_m,aes(x=xmin,xend=xmax,y=m,yend=m),color='red',size=2) +
+  scale_y_continuous(breaks=2*(1:5)) +
+  xlab('Race') + ylab('Decile Score')
+```
+
+This doesn't necessarily mean that the algorithm is returning bad predictions -- it's entirely possible that the imbalances we're seeing are the result of existing structural inequities that are just being mirrored by the algorithm. For example, minority neighborhoods often have a larger and more aggressive police presence, which leads to a higher arrest and conviction rate, aside from any differences in the crime rate. It's also possible that the algorithm is imperfectly correcting for existing imbalances, and we're seeing a compromise between individual and group fairness.
+
+## Visualizing recidivism rates
+
+Because the ProPublica dataset also contains information about recidivism, we can see how recidivism rates vary across groups. We'll work with the same variable that Northpointe, the developers of COMPAS, claim was used in model development -- whether an individual was convicted of another offense within two years after his/her release. In an ideal world, we would have information about whether they actually committed another crime; recidivism is an imperfect proxy, because other factors (including race, geography, etc.) can influence whether people who commit crimes are arrested and convicted.
+
+```{r recid}
+hi95 <- function(x) { binom.test(sum(x),length(x),0.5)$conf.int[2] }  
+lo95 <- function(x) { binom.test(sum(x),length(x),0.5)$conf.int[1] } 
+X2 <- d %>% select(decile_score,two_year_recid,race)
+X2 %>% group_by(race) %>%
+  summarize(m=mean(two_year_recid),lo=lo95(two_year_recid),hi=hi95(two_year_recid)) %>%
+  ggplot(aes(x=fct_reorder(race,m),y=m)) +
+    geom_bar(stat='identity',fill='seagreen2') +
+    geom_errorbar(aes(ymin=lo,ymax=hi),width=0.5,color='gray40') +
+    xlab('Race') + ylab('Two-year recidivism rate')
+```
+
+The recidivism rate is significantly higher for African-Americans than for other racial groups. Native Americans also have a high average rate, but with a high variance because the sample size is so small.
+
+## Testing prediction accuracy
+
+To get a better sense of what's going on, we'll want to know how well the predictions are actually working.
+
+```{r recid_decile}
+ggplot(X2,aes(x=decile_score,y=two_year_recid)) +
+  geom_jitter(size=2,shape=1,color='cornflowerblue',alpha=0.25) +
+  xlab('Decile Score') + ylab('Two-year recidivism')
+```
+
+In general, we can see a trend where people with higher scores were more likely to re-offend within two years. Plots like this can be easier to interpret if we re-cast them as line plots:
+
+```{r recid_decile_line}
+X3 <- X2 %>% select(decile_score,two_year_recid) %>%
+  table %>% 
+  as.data.frame 
+ggplot(X3,aes(x=decile_score,y=Freq,group=two_year_recid,color=two_year_recid)) +
+  geom_line()
+```
+
+In general, a person with a score of 6 or higher was more likely to re-offend than not to. Note also that the gap between the curves for reoffenders and non-reoffenders is larger for low scores than for high ones. In other words, if someone receives a low score we can be fairly confident that they won't reoffend, but at high scores there's more uncertainty about what will happen.
+
+## Race-specific error rates
+
+```{r error1}
+X4 <- X2 %>% 
+  mutate(race=as.character(race),
+         race=ifelse(race=='Asian','Other',race),
+         race=ifelse(race=='Native American','Other',race)) %>%
+  mutate(tn=(decile_score < 6) & (two_year_recid==0),
+         fn=(decile_score < 6) & (two_year_recid==1),
+         tp=(decile_score > 5) & (two_year_recid==1),
+         fp=(decile_score > 5) & (two_year_recid==0)) %>% 
+  group_by(race) %>%
+  summarize(fn_m=mean(fn),fp_m=mean(fp),fn_lo=lo95(fn),fn_hi=hi95(fn),fp_lo=lo95(fp),fp_hi=hi95(fp),
+            tn_m=mean(tn),tp_m=mean(tp),tn_lo=lo95(tn),tn_hi=hi95(tn),tp_lo=lo95(tp),tp_hi=hi95(tp))
+
+plotme <- rbind(X4 %>% select(race,fn_m,fn_lo,fn_hi) %>%
+                  rename(m=fn_m,lo=fn_lo,hi=fn_hi) %>%
+                  mutate(group='fn'),
+                X4 %>% select(race,fp_m,fp_lo,fp_hi) %>%
+                  rename(m=fp_m,lo=fp_lo,hi=fp_hi) %>%
+                  mutate(group='fp'))
+ggplot(plotme,aes(x=race,y=m,group=group,fill=group)) +
+  geom_bar(stat='identity',position='stack') +
+  xlab('Race') + ylab('Error rates')
+```
+
+Overall error rates are reasonably similar across racial groups, but the balance of errors seems different. We can understand this a little better by looking at false positives (people who were predicted to be high-risk but ultimately didn't reoffend) separately from false negatives (people predicted to be low-risk who reoffended within two years).
+
+```{r falsepos}
+ggplot(plotme %>% filter(group=='fp'),
+       aes(x=fct_reorder(race,m),y=m)) +
+  geom_bar(stat='identity',position='dodge',fill='goldenrod') +
+  geom_errorbar(aes(ymin=lo,ymax=hi),width=0.5,color='gray40') +
+  xlab('Race') + ylab('Error rates') +
+  ggtitle('False positives')
+```
+
+The rate of false positives is significantly higher among African-Americans than among other racial groups. 
+
+```{r falseneg}
+ggplot(plotme %>% filter(group=='fn'),
+       aes(x=fct_reorder(race,m),y=m)) +
+  geom_bar(stat='identity',position='dodge',fill='goldenrod') +
+  geom_errorbar(aes(ymin=lo,ymax=hi),width=0.5,color='gray40') +
+  xlab('Race') + ylab('Error rates') +
+  ggtitle('False negatives')
+```
+
+At the same time, the rate of false negatives is lower among African-Americans than among other groups. Taken together, this means that the model's mistakes tend (on average) to work to the detriment of Black defendants and to the benefit of non-Black defendants. This isn't proof that the model is individually unfair -- establishing that would require the ability to test counterfactual examples -- but it isn't exactly reassuring.
+
+## Introducing Yellowbrick
+
+Now that we've got a sense of what is going on in this datset, we can try out some of the machine learning visualization tools that come with Yellowbrick. As I mentioned in the introduction, we'll use the `reticulate` package to include Python tools into our R workflow.
+
+Yellowbrick runs on the assumption that it is visualizing the output of an estimator trained with `scikit-learn`. Because we don't have an actual machine learning model here, I'll have to define a new estimator class that is trained on a single input variable `X`, and returns exactly the same value as its output variable `y`.
+
+```{python defn}
+from sklearn.base import BaseEstimator, ClassifierMixin
+import numpy as np
+
+class Identity(BaseEstimator, ClassifierMixin):
+    def fit(self, X, y=None):
+        return self 
+    def predict(self, X):
+        if X.ndim > 1:
+            raise ValueError("pass through, provide y_true!")
+        return (X > 0.5) 
+    def predict_proba(self, X):
+        if X.ndim > 1:
+            raise ValueError("pass through, provide y_true!")
+        Xr = X.values.reshape(-1,1)
+        Xinv = (1.0 - X).values.reshape(-1,1)
+        return np.concatenate([Xr,Xinv],axis=1)
+``` 
+
+We'll first look at the ClassificationReport visualizer, which displays a heatmap of different accuracy metrics for a model.
+
+```{python classrep_caucasian}
+from yellowbrick.classifier import ClassificationReport
+import pandas as pd
+import matplotlib.pyplot as plt
+
+d = pd.DataFrame.from_dict(r.d) # access the variable 'd' defined in the R environment
+
+def race_cr(racestr,threshold=5):
+    race_sel = d['race'] == racestr
+    X = (d['decile_score'] > threshold).astype(int)[race_sel]
+    y = d['two_year_recid'][race_sel]
+    viz = ClassificationReport(Identity(),classes=['Doesn\'t reoffend','Re-offends'])
+    viz.fit(X,y)
+    viz.score(X,y)
+    viz.poof()
+    plt.close() # reticulate seems to need this, or else plots will overlap
+
+race_cr('Caucasian')
+```
+
+```{python classrep_aa}
+race_cr('African-American')
+```
+
+We already knew that we have a higher false negative rate for Caucasians, and a higher false positive rate for African-Americans. We also know that African-Americans have a higher overall recidivism rate, along with a lower true-negative rate and a higher true-positive rate. Here, we see that accuracy is balanced across the different classes very differently for the two groups -- for Caucasians, the model performs better for non-reoffenders (the larger group), while for African-Americans errors are more evenly balanced across the two classes.
+
+_Precision_ is defined as TP/(TP + FP). In the case of re-offenders, this is the fraction of those predicted to re-offend by the algorithm who actually did. Comparing positive predictions of re-offense, this measure is slightly higher for African-Americans than for Caucasians, as their true and false positive rates are both higher. 
+
+_Recall_ is defined as TP/(TP + FN) - the fraction of those who really did reoffend who were predicted to re-offend by the algorithm. Here there is a much larger racial disparity. Caucasians have a lower TP and a higher FN rate than African-Americans. 
+
+It's possible that, when developing the COMPAS algorithm, the Northpointe team looked at the similar precision rates across both groups and concluded that their algorithm was non-discriminatory. It's worth thinking about the implications of different definitions of accuracy. Suppose, in an extreme case, that an algorithm simply predicted that everyone would reoffend. Such a model would have a false negative rate of zero (because it never makes a negative prediction) and a rather high false positive rate. This would lead to a high recall rate (it's catching everybody) and a low precision rate (it's catching people indiscriminately). On the other hand, a very conservative model with a high false negative rate and a low false positive rate would give us high precision and low recall. Based on these race-disaggregated classification reports, it appears that Caucasian defendents were seeing a conservative model (one that gave them the benefit of the doubt) while African-Americans were seeing a much more balanced version.
+
+We can also use Yellowbrick to calculate class-specific ROC curves:
+
+```{python ROC}
+from yellowbrick.classifier import ROCAUC
+
+def race_roc(racestr):
+    race_sel = d['race'] == racestr
+    X = (d['decile_score']/9)[race_sel]
+    y = (1 - d['two_year_recid'])[race_sel]
+    viz = ROCAUC(Identity(),classes=['No reoffense','Reoffense'])
+    viz.fit(X,y)
+    viz.score(X,y)
+    viz.poof()
+    plt.close()
+
+race_roc('Caucasian')
+```
+
+*NOTE:* I'm a little puzzled as to why I need to use `(1-d['two_year_recid'])` instead of just `d['two_year_recid']`. It seems like high values of two_year_recid (1 rather than 0) should correlate with high values of decile_score. This probably has something to do with the way that YB is ordering the classes -- y=0 is being associated with the second column of X rather than the first. Should fix this before publishing.
+
+```{python ROC2}
+race_roc('African-American')
+```
+
+## Varying thresholds
+
+While it's really cool to be able to calculate ROC curves so easily, I was a little disappointed at how similar they looked -- these might not be the best tool for highlighting the disparities between different sub-populations. If we want to find a way to make models like this more fair, the easiest thing to think about is the threshold between "low-risk" and "high-risk". Thus far, we've been assuming a threshold of 5 (on a 1-10 scale). Yellowbrick's `ThresholdVisualizer` lets us see what some of the implications of varying this threshold would be. As before, we'll want to see how it impacts Caucasian and African-American populations differently.
+
+```{python AA_tv}
+from yellowbrick.classifier import ThresholdVisualizer
+
+def race_tv(racestr):
+    race_sel = d['race'] == racestr
+    X = (d['decile_score'][race_sel])/9
+    y = 1-d['two_year_recid'][race_sel].as_matrix()
+    viz = ThresholdVisualizer(Identity(),classes=['Doesn\'t reoffend','Re-offends'])
+    viz.fit(X,y)
+    viz.score(X,y)
+    viz.poof()
+    plt.close()
+    
+race_tv('African-American')
+```
+
+For African-Americans, the precision and recall curves cross each other roughly in the middle of the range, consistent with our observations that errors seemed fairly balanced with a threshold of 5. Things look slightly different for Caucasians:
+
+```{python AA_c}
+race_tv('Caucasian')
+```
+
+Here, the "precision" curve is higher and flatter, and crosses the "recall" curve at a higher value of the threshold. The precision curve increases monotonically with the threshold (as the number of false positives decreases) and the recall curve decreases monotonically (as the number of false negatives increases). 
+
+The ideal tradeoff between false positives and false negatives is ultimately a social choice -- we have to choose how to weight the risk of letting dangerous people go free against the risk of needlessly imprisoning harmless people. If, for the sake of argument, we assume that African-Americans are seeing a "fair" version of the model (in the sense that errors are balanced across classes), then Caucasians are seeing an overly lenient version of the model. Making the model tougher on Caucasians would require lowering the threshold, so that a larger fraction of marginal people are deemed to be high-risk. The ThresholdVisualizer plots don't tell us precisely where to do this, because they are concerned with the types of errors across a single class, rather than the balance of errors across classes. By showing us how error rates depend on thresholds, however, they can give us some ideas about where to experiment. For example, if we lower the cutoff for Caucasians to 3 (rather than 5), we see the following:
+
+```{python classrep_c2}
+race_cr('Caucasian',threshold=3)
+```
+
+Comparing this to the classification reports we saw above, we can see a somewhat better balance of errors for Caucasians, resulting from a lower number of false negatives and a higher number of false positives.
+
+A simple analysis like this can't uncover all of the problems with algorithmic decision-making in the criminal justice system, let alone propose a set of truly viable solutions. Hopefully, though, it's clear that simple visualization tools are able to uncover systemic bias and suggest some of the implications of different error measures. The real challenge is convincing goverments and communities to be more skeptical users and consumers of these tools.
+
+

@@ -107,3 +107,16 @@ X2 %>% group_by(race) %>%
     geom_bar(stat='identity',fill='seagreen2') +
     geom_errorbar(aes(ymin=lo,ymax=hi),width=0.5,color='gray40') +
     xlab('Race') + ylab('Two-year recidivism rate')
+
+# **TODO:** I need to look into selection bias -- only people who were predicted 
+# by a judge not to reoffend (regardless of their scores) got out in the first 
+# place. Take a look at prison in and out dates from the dataset to see if the time 
+# they spent locked up had anything to do with their score predictions -- could 
+# be a measure of how much judges were actually paying attention.
+
+# I think it's c_jail_in and c_jail_out that I want. Need to install lubridate, get
+# gap between the two. Correlation with misdemeanor/felony, also with decile_score (and other things)
+# r_jail_in/out must just be for reoffenses; make sure it correlates with reoffense variables.
+# Also, "" --> NA
+# Maybe relationship between COMPAS evaluation date and others...?
+
