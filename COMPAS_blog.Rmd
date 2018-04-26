@@ -169,7 +169,7 @@ class Identity(BaseEstimator, ClassifierMixin):
             raise ValueError("pass through, provide y_true!")
         Xr = X.values.reshape(-1,1)
         Xinv = (1.0 - X).values.reshape(-1,1)
-        return np.concatenate([Xr,Xinv],axis=1)
+        return np.concatenate([Xinv,Xr],axis=1)
 ``` 
 
 We'll first look at the ClassificationReport visualizer, which displays a heatmap of different accuracy metrics for a model.
@@ -214,7 +214,7 @@ from yellowbrick.classifier import ROCAUC
 def race_roc(racestr):
     race_sel = d['race'] == racestr
     X = (d['decile_score']/9)[race_sel]
-    y = (1 - d['two_year_recid'])[race_sel]
+    y = d['two_year_recid'][race_sel]
     viz = ROCAUC(Identity(),classes=['No reoffense','Reoffense'])
     viz.fit(X,y)
     viz.score(X,y)
@@ -224,11 +224,13 @@ def race_roc(racestr):
 race_roc('Caucasian')
 ```
 
-*NOTE:* I'm a little puzzled as to why I need to use `(1-d['two_year_recid'])` instead of just `d['two_year_recid']`. It seems like high values of two_year_recid (1 rather than 0) should correlate with high values of decile_score. This probably has something to do with the way that YB is ordering the classes -- y=0 is being associated with the second column of X rather than the first. Should fix this before publishing.
+The ROC curve for Caucasians shows that the overall performance of this model is significant, but not spectacular.
 
 ```{python ROC2}
 race_roc('African-American')
 ```
+
+Things look fairly similar for African-American defendants.
 
 ## Varying thresholds
 
@@ -240,7 +242,7 @@ from yellowbrick.classifier import ThresholdVisualizer
 def race_tv(racestr):
     race_sel = d['race'] == racestr
     X = (d['decile_score'][race_sel])/9
-    y = 1-d['two_year_recid'][race_sel].as_matrix()
+    y = d['two_year_recid'][race_sel].as_matrix()
     viz = ThresholdVisualizer(Identity(),classes=['Doesn\'t reoffend','Re-offends'])
     viz.fit(X,y)
     viz.score(X,y)
@@ -256,7 +258,7 @@ For African-Americans, the precision and recall curves cross each other roughly 
 race_tv('Caucasian')
 ```
 
-Here, the "precision" curve is higher and flatter, and crosses the "recall" curve at a higher value of the threshold. The precision curve increases monotonically with the threshold (as the number of false positives decreases) and the recall curve decreases monotonically (as the number of false negatives increases). 
+Here, the "precision" curve is higher and flatter, and crosses the "recall" curve at a lower value of the threshold. The precision curve increases monotonically with the threshold (as the number of false positives decreases) and the recall curve decreases monotonically (as the number of false negatives increases). 
 
 The ideal tradeoff between false positives and false negatives is ultimately a social choice -- we have to choose how to weight the risk of letting dangerous people go free against the risk of needlessly imprisoning harmless people. If, for the sake of argument, we assume that African-Americans are seeing a "fair" version of the model (in the sense that errors are balanced across classes), then Caucasians are seeing an overly lenient version of the model. Making the model tougher on Caucasians would require lowering the threshold, so that a larger fraction of marginal people are deemed to be high-risk. The ThresholdVisualizer plots don't tell us precisely where to do this, because they are concerned with the types of errors across a single class, rather than the balance of errors across classes. By showing us how error rates depend on thresholds, however, they can give us some ideas about where to experiment. For example, if we lower the cutoff for Caucasians to 3 (rather than 5), we see the following:
 
